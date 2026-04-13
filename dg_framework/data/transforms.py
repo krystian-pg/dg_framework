@@ -31,17 +31,18 @@ def get_train_transform(
 	color_jitter_strength: float = 0.2,
 ) -> transforms.Compose:
 	size = _normalize_size(img_size)
+	hue_strength = max(0.0, min(0.1, color_jitter_strength / 2))
 	return transforms.Compose(
 		[
 			transforms.RandomResizedCrop(size=size, scale=(0.8, 1.0)),
 			transforms.RandomHorizontalFlip(p=hflip_prob),
+			transforms.ToTensor(),
 			transforms.ColorJitter(
 				brightness=color_jitter_strength,
 				contrast=color_jitter_strength,
 				saturation=color_jitter_strength,
-				hue=min(0.1, color_jitter_strength / 2),
+				hue=hue_strength,
 			),
-			transforms.ToTensor(),
 			transforms.Normalize(mean=mean, std=std),
 		]
 	)
@@ -73,6 +74,7 @@ def get_tta_transforms(
 	size = _normalize_size(img_size)
 	if n_augments < 1:
 		raise ValueError("n_augments must be >= 1")
+	hue_strength = max(0.0, min(0.05, color_jitter_strength / 2))
 
 	tta_list: list[transforms.Compose] = []
 	for _ in range(n_augments):
@@ -81,13 +83,14 @@ def get_tta_transforms(
 				[
 					transforms.RandomResizedCrop(size=size, scale=(0.9, 1.0)),
 					transforms.RandomHorizontalFlip(p=hflip_prob),
+					# Run jitter on tensors to avoid PIL hue overflow with older torchvision+numpy combos.
+					transforms.ToTensor(),
 					transforms.ColorJitter(
 						brightness=color_jitter_strength,
 						contrast=color_jitter_strength,
 						saturation=color_jitter_strength,
-						hue=min(0.05, color_jitter_strength / 2),
+						hue=hue_strength,
 					),
-					transforms.ToTensor(),
 					transforms.Normalize(mean=mean, std=std),
 				]
 			)

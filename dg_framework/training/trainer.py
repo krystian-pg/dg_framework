@@ -85,10 +85,28 @@ class Trainer:
 		raise TypeError("loaders must be dict with train/val or tuple(train_loader, val_loader, ...)")
 
 	def _resolve_monitor(self) -> tuple[str, str]:
+		es_cfg = getattr(self.config.train, "early_stopping", None)
 		metrics = set(getattr(self.config.evaluation, "metrics", []))
-		if "accuracy" in metrics:
-			return "val_accuracy", "max"
-		return "val_loss", "min"
+
+		monitor_choice = str(getattr(es_cfg, "monitor", "auto")).lower() if es_cfg is not None else "auto"
+		if monitor_choice not in {"auto", "val_loss", "val_accuracy"}:
+			monitor_choice = "auto"
+
+		if monitor_choice == "auto":
+			monitor_key = "val_accuracy" if "accuracy" in metrics else "val_loss"
+		else:
+			monitor_key = monitor_choice
+
+		mode_choice = str(getattr(es_cfg, "mode", "auto")).lower() if es_cfg is not None else "auto"
+		if mode_choice not in {"auto", "min", "max"}:
+			mode_choice = "auto"
+
+		if mode_choice == "auto":
+			monitor_mode = "max" if monitor_key == "val_accuracy" else "min"
+		else:
+			monitor_mode = mode_choice
+
+		return monitor_key, monitor_mode
 
 	@staticmethod
 	def _unpack_batch(batch: Any) -> tuple[torch.Tensor, torch.Tensor]:

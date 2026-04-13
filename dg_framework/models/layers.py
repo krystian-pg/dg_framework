@@ -61,6 +61,47 @@ class DropBlock2d(nn.Module):
 		return x * keep_mask * scale
 
 
+class MixStyle(nn.Module):
+	"""MixStyle feature perturbation for domain generalization on 4D feature maps."""
+
+	def __init__(self, p: float = 0.5, alpha: float = 0.1, eps: float = 1e-6) -> None:
+		super().__init__()
+		if not 0.0 <= p <= 1.0:
+			raise ValueError("p must be in [0, 1]")
+		if alpha <= 0.0:
+			raise ValueError("alpha must be > 0")
+		if eps <= 0.0:
+			raise ValueError("eps must be > 0")
+		self.p = p
+		self.alpha = alpha
+		self.eps = eps
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		if not self.training or self.p <= 0.0:
+			return x
+		if x.dim() != 4:
+			return x
+		if x.size(0) < 2:
+			return x
+		if torch.rand(1, device=x.device).item() > self.p:
+			return x
+
+		mu = x.mean(dim=(2, 3), keepdim=True)
+		sigma = torch.sqrt(x.var(dim=(2, 3), keepdim=True, unbiased=False) + self.eps)
+		x_norm = (x - mu) / sigma
+
+		lam = torch.distributions.Beta(self.alpha, self.alpha).sample((x.size(0), 1, 1, 1))
+		lam = lam.to(device=x.device, dtype=x.dtype)
+		perm = torch.randperm(x.size(0), device=x.device)
+
+		mu_perm = mu[perm]
+		sigma_perm = sigma[perm]
+
+		mu_mix = lam * mu + (1.0 - lam) * mu_perm
+		sigma_mix = lam * sigma + (1.0 - lam) * sigma_perm
+		return x_norm * sigma_mix + mu_mix
+
+
 class SpectralNormWrapper(nn.Module):
 	"""Wrap any module and apply spectral normalization to its weight parameter."""
 
@@ -133,6 +174,7 @@ class BottleneckAdapter(nn.Module):
 __all__ = [
 	"PassThrough",
 	"DropBlock2d",
+	"MixStyle",
 	"SpectralNormWrapper",
 	"DomainAgnosticBatchNorm2d",
 	"BottleneckAdapter",
@@ -154,6 +196,12 @@ if __name__ == "__main__":
 	assert y_drop.shape == x.shape, "DropBlock2d must preserve input shape"
 	assert torch.isfinite(y_drop).all(), "DropBlock2d output contains invalid values"
 
+	mixstyle = MixStyle(p=1.0, alpha=0.1)
+	mixstyle.train()
+	y_mix = mixstyle(x)
+	assert y_mix.shape == x.shape, "MixStyle must preserve input shape"
+	assert torch.isfinite(y_mix).all(), "MixStyle output contains invalid values"
+
 	conv_sn = SpectralNormWrapper(nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False))
 	y_sn = conv_sn(x)
 	assert y_sn.shape == x.shape, "SpectralNormWrapper must preserve expected conv output shape"
@@ -168,4 +216,4 @@ if __name__ == "__main__":
 	y_adapter = adapter(x)
 	assert y_adapter.shape == x.shape, "BottleneckAdapter must preserve input shape"
 
-	print("Custom layers check passed: PassThrough, DropBlock2d, SpectralNormWrapper, DomainAgnosticBatchNorm2d, BottleneckAdapter")
+	print("Custom layers check passed: PassThrough, DropBlock2d, MixStyle, SpectralNormWrapper, DomainAgnosticBatchNorm2d, BottleneckAdapter")

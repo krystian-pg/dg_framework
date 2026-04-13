@@ -1,9 +1,21 @@
 from __future__ import annotations
 
 import logging
+import sys
 from collections import OrderedDict
+from pathlib import Path
+from typing import Any
 
+import torch
 import torch.nn as nn
+
+try:
+	from dg_framework.models.layers import MixStyle
+except ModuleNotFoundError:
+	project_root = Path(__file__).resolve().parents[1]
+	if str(project_root) not in sys.path:
+		sys.path.append(str(project_root))
+	from models.layers import MixStyle
 
 try:
 	import timm
@@ -30,6 +42,70 @@ def _group_parameters(backbone: nn.Module) -> OrderedDict[str, list[nn.Parameter
 		group_name = param_name.split(".", 1)[0]
 		groups.setdefault(group_name, []).append(param)
 	return groups
+
+
+def _cfg_get(config: Any, key: str, default: Any) -> Any:
+	if config is None:
+		return default
+	if isinstance(config, dict):
+		return config.get(key, default)
+	return getattr(config, key, default)
+
+
+def _attach_mixstyle_hooks(
+	backbone: nn.Module,
+	model_cfg: Any,
+	logger: logging.Logger,
+) -> list[str]:
+	enabled = bool(_cfg_get(model_cfg, "mixstyle_enabled", False))
+	if not enabled:
+		return []
+
+	p = float(_cfg_get(model_cfg, "mixstyle_p", 0.5))
+	alpha = float(_cfg_get(model_cfg, "mixstyle_alpha", 0.1))
+	eps = float(_cfg_get(model_cfg, "mixstyle_eps", 1e-6))
+	layer_names = [str(name) for name in _cfg_get(model_cfg, "mixstyle_layers", ())]
+
+	if not layer_names:
+		logger.warning("MixStyle enabled but no layer names were provided; skipping MixStyle hooks")
+		return []
+
+	module_map = dict(backbone.named_modules())
+	mixstyle_blocks = nn.ModuleDict()
+	handles: list[Any] = []
+	attached_layers: list[str] = []
+
+	for idx, layer_name in enumerate(layer_names):
+		if layer_name not in module_map:
+			logger.warning("MixStyle target '%s' not found in backbone modules; skipping", layer_name)
+			continue
+
+		target_module = module_map[layer_name]
+		module_key = f"layer_{idx}_{layer_name.replace('.', '_')}"
+		mixstyle_blocks[module_key] = MixStyle(p=p, alpha=alpha, eps=eps)
+
+		def _hook(_module: nn.Module, _inputs: tuple[Any, ...], output: Any, key: str = module_key) -> Any:
+			if isinstance(output, torch.Tensor) and output.dim() == 4:
+				return mixstyle_blocks[key](output)
+			return output
+
+		handles.append(target_module.register_forward_hook(_hook))
+		attached_layers.append(layer_name)
+
+	if not attached_layers:
+		logger.warning("MixStyle enabled but no hooks were attached")
+		return []
+
+	backbone.add_module("mixstyle_blocks", mixstyle_blocks)
+	setattr(backbone, "_mixstyle_hook_handles", handles)
+	logger.info(
+		"MixStyle enabled: layers=%s, p=%.3f, alpha=%.3f, eps=%g",
+		attached_layers,
+		p,
+		alpha,
+		eps,
+	)
+	return attached_layers
 
 
 def _freeze_parameter_groups(
@@ -76,6 +152,7 @@ def load_backbone(
 	name: str,
 	pretrained: bool,
 	freeze_up_to: int | None,
+	model_cfg: Any | None = None,
 ) -> tuple[nn.Module, int]:
 	"""Load a timm backbone as feature extractor and optionally freeze early groups.
 
@@ -83,6 +160,7 @@ def load_backbone(
 		name: timm model name.
 		pretrained: Whether to load pretrained weights.
 		freeze_up_to: Number of leading parameter groups to freeze.
+		model_cfg: Model config with optional MixStyle settings.
 
 	Returns:
 		(backbone, feature_dim)
@@ -98,6 +176,7 @@ def load_backbone(
 	feature_dim = _infer_feature_dim(backbone)
 
 	_freeze_parameter_groups(backbone, freeze_up_to, logger)
+	_attach_mixstyle_hooks(backbone, model_cfg=model_cfg, logger=logger)
 	logger.info(
 		"Backbone loaded: name=%s, pretrained=%s, feature_dim=%s",
 		name,
@@ -123,6 +202,7 @@ if __name__ == "__main__":
 		name=model_name,
 		pretrained=False,
 		freeze_up_to=2,
+		model_cfg=None,
 	)
 
 	assert isinstance(backbone, nn.Module), "Backbone must be an nn.Module"

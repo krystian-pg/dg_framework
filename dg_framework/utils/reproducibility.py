@@ -15,6 +15,10 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
 	When deterministic=True, this enables deterministic kernels for reproducibility.
 	Note: deterministic execution can reduce training throughput.
 	"""
+	if deterministic:
+		# Required by CuBLAS for deterministic CUDA behavior on CUDA >= 10.2.
+		os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 	os.environ["PYTHONHASHSEED"] = str(seed)
 	random.seed(seed)
 	np.random.seed(seed)

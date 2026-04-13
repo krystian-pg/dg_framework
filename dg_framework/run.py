@@ -86,12 +86,22 @@ class _WandbHook:
 
 
 def _config_summary_table(cfg: Config) -> str:
+	es_cfg = getattr(cfg.train, "early_stopping", None)
+	es_enabled = bool(getattr(es_cfg, "enabled", True)) if es_cfg is not None else True
+	es_patience = int(getattr(es_cfg, "patience", getattr(cfg.train, "early_stopping_patience", 5)))
+	es_monitor = str(getattr(es_cfg, "monitor", "auto")) if es_cfg is not None else "auto"
+	es_mode = str(getattr(es_cfg, "mode", "auto")) if es_cfg is not None else "auto"
+
 	rows = [
 		("dataset", cfg.data.dataset_name),
 		("target_domain", cfg.data.target_domain),
 		("image_size", f"{cfg.data.image_size[0]}x{cfg.data.image_size[1]}"),
 		("device_pref", cfg.train.device),
 		("backbone", cfg.model.backbone_name),
+		("mixstyle", str(cfg.model.mixstyle_enabled)),
+		("mixstyle_p", f"{cfg.model.mixstyle_p:.2f}"),
+		("mixstyle_alpha", f"{cfg.model.mixstyle_alpha:.2f}"),
+		("mixstyle_layers", ",".join(cfg.model.mixstyle_layers)),
 		("head", cfg.model.head_type),
 		("epochs", str(cfg.train.epochs)),
 		("batch_size", str(cfg.train.batch_size)),
@@ -101,6 +111,10 @@ def _config_summary_table(cfg: Config) -> str:
 		("lr", f"{cfg.train.lr:.2e}"),
 		("scheduler", cfg.train.scheduler.scheduler_type),
 		("warmup_epochs", str(cfg.train.lr_warmup_epochs)),
+		("early_stop", str(es_enabled)),
+		("es_patience", str(es_patience)),
+		("es_monitor", es_monitor),
+		("es_mode", es_mode),
 		("amp", str(cfg.train.amp)),
 		("progress", str(getattr(cfg.train, "show_progress", True))),
 		("ema", str(cfg.train.ema.enabled)),
@@ -185,12 +199,17 @@ def _describe_head(head_module: torch.nn.Module) -> str:
 
 def _format_model_diagram(model: DGClassifier, cfg: Config) -> str:
 	head_desc = _describe_head(model.head)
+	mixstyle_desc = "disabled"
+	if cfg.model.mixstyle_enabled:
+		mixstyle_desc = ", ".join(cfg.model.mixstyle_layers)
 
 	lines = [
 		"MODEL BLOCK DIAGRAM",
 		"[Input: Bx3xHxW]",
 		"      |",
 		f"[Backbone: {cfg.model.backbone_name}]",
+		"      |",
+		f"[MixStyle Hooks: {mixstyle_desc}]",
 		"      |",
 		f"[Optional Layers: {model.optional_layers.__class__.__name__}]",
 		"      |",
@@ -292,6 +311,7 @@ def _build_model(cfg: Config, num_classes: int, device: torch.device) -> DGClass
 		name=cfg.model.backbone_name,
 		pretrained=cfg.model.pretrained,
 		freeze_up_to=cfg.model.freeze_up_to,
+		model_cfg=cfg.model,
 	)
 	model = DGClassifier(
 		backbone=backbone,
@@ -373,36 +393,65 @@ def _build_scheduler(cfg: Config, optimiser: Optimizer):
 	)
 
 
-def _build_early_stopping(cfg: Config) -> EarlyStopping:
-	monitor_mode = "max" if "accuracy" in set(cfg.evaluation.metrics) else "min"
-	patience = int(getattr(cfg.train, "early_stopping_patience", 5))
-	min_delta = float(getattr(cfg.train, "early_stopping_min_delta", 0.0))
-	restore = bool(getattr(cfg.train, "restore_best_weights", True))
+def _build_early_stopping(cfg: Config) -> EarlyStopping | None:
+	es_cfg = getattr(cfg.train, "early_stopping", None)
+
+	if es_cfg is None:
+		monitor_mode = "max" if "accuracy" in set(cfg.evaluation.metrics) else "min"
+		patience = int(getattr(cfg.train, "early_stopping_patience", 5))
+		min_delta = float(getattr(cfg.train, "early_stopping_min_delta", 0.0))
+		restore = bool(getattr(cfg.train, "restore_best_weights", True))
+		return EarlyStopping(
+			patience=patience,
+			min_delta=min_delta,
+			mode=monitor_mode,
+			restore_best_weights=restore,
+		)
+
+	if not bool(es_cfg.enabled):
+		return None
+
+	monitor_choice = str(es_cfg.monitor)
+	if monitor_choice == "auto":
+		monitor_choice = "val_accuracy" if "accuracy" in set(cfg.evaluation.metrics) else "val_loss"
+
+	mode_choice = str(es_cfg.mode)
+	if mode_choice == "auto":
+		mode_choice = "max" if monitor_choice == "val_accuracy" else "min"
 
 	return EarlyStopping(
-		patience=patience,
-		min_delta=min_delta,
-		mode=monitor_mode,
-		restore_best_weights=restore,
+		patience=int(es_cfg.patience),
+		min_delta=float(es_cfg.min_delta),
+		mode=mode_choice,
+		restore_best_weights=bool(es_cfg.restore_best_weights),
 	)
 
 
 def _normalise_metric_names(cfg: Config) -> list[str]:
+	required_metrics = [
+		"accuracy",
+		"f1_micro",
+		"f1_macro",
+		"f1_weighted",
+		"brier_score",
+		"balanced_accuracy",
+		"cohen_kappa",
+		"expected_calibration_error",
+		"top_k_accuracy",
+	]
+
 	resolved: list[str] = []
 	for metric_name in cfg.evaluation.metrics:
 		if metric_name == "f1":
 			resolved.append("f1_macro")
+		elif metric_name == "ece":
+			resolved.append("expected_calibration_error")
 		else:
 			resolved.append(metric_name)
 
-	if any(k > 1 for k in cfg.evaluation.top_k) and "top_k_accuracy" not in resolved:
-		resolved.append("top_k_accuracy")
-
-	# Keep calibration metrics explicit in the final report.
-	if "expected_calibration_error" not in resolved and "ece" not in resolved:
-		resolved.append("expected_calibration_error")
-	if "brier_score" not in resolved:
-		resolved.append("brier_score")
+	for metric_name in required_metrics:
+		if metric_name not in resolved:
+			resolved.append(metric_name)
 
 	ordered = []
 	seen = set()

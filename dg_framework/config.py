@@ -20,10 +20,14 @@ class ModelConfig:
 	backbone_name: str = "resnet50"
 	pretrained: bool = True
 	freeze_up_to: int | None = None
-	use_custom_layers: bool = False
-	head_type: Literal["linear", "mlp"] = "linear"
+	head_type: Literal["linear", "mlp"] = "mlp"
 	head_depth: int = 2
 	head_width: int = 512
+	mixstyle_enabled: bool = False
+	mixstyle_p: float = 0.5
+	mixstyle_alpha: float = 0.1
+	mixstyle_eps: float = 1e-6
+	mixstyle_layers: tuple[str, ...] = ("layer1", "layer2", "layer3")
 
 
 @dataclass
@@ -43,8 +47,18 @@ class EMAConfig:
 
 
 @dataclass
+class EarlyStoppingConfig:
+	enabled: bool = True
+	patience: int = 10
+	min_delta: float = 0.0
+	monitor: Literal["auto", "val_loss", "val_accuracy"] = "val_loss"
+	mode: Literal["auto", "min", "max"] = "min"
+	restore_best_weights: bool = False
+
+
+@dataclass
 class TrainConfig:
-	epochs: int = 30
+	epochs: int = 100
 	batch_size: int = 32
 	lr: float = 3e-4
 	weight_decay: float = 1e-4
@@ -56,11 +70,12 @@ class TrainConfig:
 	grad_clip: float | None = 1.0
 	grad_accum_steps: int = 1
 	amp: bool = True
-	device: Literal["auto", "cpu", "cuda", "mps"] = "mps"
+	device: Literal["auto", "cpu", "cuda", "mps"] = "auto"
 	show_progress: bool = True
 	progress_log_interval: int = 20
 	deterministic: bool = True
 	ema: EMAConfig = field(default_factory=EMAConfig)
+	early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
 	seed: int = 42
 
 
@@ -72,7 +87,19 @@ class TTAConfig:
 
 @dataclass
 class EvalConfig:
-	metrics: list[str] = field(default_factory=lambda: ["accuracy", "f1", "ece"])
+	metrics: list[str] = field(
+		default_factory=lambda: [
+			"accuracy",
+			"f1_micro",
+			"f1_macro",
+			"f1_weighted",
+			"brier_score",
+			"balanced_accuracy",
+			"cohen_kappa",
+			"expected_calibration_error",
+			"top_k_accuracy",
+		]
+	)
 	top_k: tuple[int, ...] = (1, 5)
 	ece_bins: int = 15
 	tta: TTAConfig = field(default_factory=TTAConfig)
@@ -81,11 +108,11 @@ class EvalConfig:
 
 @dataclass
 class ExperimentConfig:
-	name: str = "pacs_baseline_2"
-	output_root: str = "../outputs"
+	name: str = "sketch_baseline_mlp_head"
+	output_root: str = "./outputs"
 	use_wandb: bool = False
 	log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
-	save_confusion_matrix: bool = True
+	save_confusion_matrix: bool = False
 	export_embeddings: bool = False
 	tags: list[str] = field(default_factory=lambda: ["pacs", "dg"])
 
@@ -110,6 +137,16 @@ def validate_cfg(cfg: Config) -> None:
 		raise ValueError("model.freeze_up_to must be >= 0 or None")
 	if cfg.model.head_depth < 1 or cfg.model.head_width < 1:
 		raise ValueError("model.head_depth and model.head_width must be >= 1")
+	if not 0.0 <= cfg.model.mixstyle_p <= 1.0:
+		raise ValueError("model.mixstyle_p must be in [0, 1]")
+	if cfg.model.mixstyle_alpha <= 0.0:
+		raise ValueError("model.mixstyle_alpha must be > 0")
+	if cfg.model.mixstyle_eps <= 0.0:
+		raise ValueError("model.mixstyle_eps must be > 0")
+	if any(not isinstance(layer_name, str) or not layer_name.strip() for layer_name in cfg.model.mixstyle_layers):
+		raise ValueError("model.mixstyle_layers must contain non-empty strings")
+	if cfg.model.mixstyle_enabled and not cfg.model.mixstyle_layers:
+		raise ValueError("model.mixstyle_layers must be non-empty when model.mixstyle_enabled=True")
 	if cfg.train.epochs < 1 or cfg.train.batch_size < 1:
 		raise ValueError("train.epochs and train.batch_size must be >= 1")
 	if cfg.train.lr <= 0 or cfg.train.weight_decay < 0:
@@ -126,6 +163,14 @@ def validate_cfg(cfg: Config) -> None:
 		raise ValueError("train.grad_clip must be > 0 or None")
 	if cfg.train.ema.decay <= 0.0 or cfg.train.ema.decay >= 1.0:
 		raise ValueError("train.ema.decay must be in (0, 1)")
+	if cfg.train.early_stopping.patience < 0:
+		raise ValueError("train.early_stopping.patience must be >= 0")
+	if cfg.train.early_stopping.min_delta < 0.0:
+		raise ValueError("train.early_stopping.min_delta must be >= 0")
+	if cfg.train.early_stopping.monitor not in {"auto", "val_loss", "val_accuracy"}:
+		raise ValueError("train.early_stopping.monitor must be one of: 'auto', 'val_loss', 'val_accuracy'")
+	if cfg.train.early_stopping.mode not in {"auto", "min", "max"}:
+		raise ValueError("train.early_stopping.mode must be one of: 'auto', 'min', 'max'")
 	if cfg.evaluation.ece_bins < 1:
 		raise ValueError("evaluation.ece_bins must be >= 1")
 	if not cfg.evaluation.top_k or any(k < 1 for k in cfg.evaluation.top_k):
