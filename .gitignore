@@ -41,6 +41,5 @@ Thumbs.db
 *.txt
 *.log
 *.csv
-data/
 results/
 outputs/
